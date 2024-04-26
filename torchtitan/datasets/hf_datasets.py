@@ -8,6 +8,7 @@ from typing import List, Optional
 
 import torch
 from torch.utils.data import DataLoader, IterableDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from torchtitan.datasets.tokenizer import Tokenizer
 from torchtitan.logging_utils import logger
@@ -107,35 +108,69 @@ class HuggingFaceDataset(IterableDataset):
 
         self.dataset_name = dataset_name
         self._data = split_dataset_by_node(ds, rank, world_size)
+        self._sample_idx = 0
         self._tokenizer = tokenizer
+        self._all_tokens: List[int] = []
         self.seq_len = seq_len
         self.infinite = infinite
+        self._first_iter = True
 
     def __iter__(self):
         max_buffer_token_len = 1 + self.seq_len
-        all_tokens: List[int] = []
 
         while True:
-            for sample in iter(self._data):
+            # Skip samples for the first iteration
+            data_iter = self._get_skipped_data_iter(self._sample_idx) if self._first_iter else iter(self._data)
+            self._first_iter = False
+
+            for sample in data_iter:
                 sample_text = sample["text"]
                 sample_tokens = self._tokenizer.encode(sample_text, bos=True, eos=True)
-                all_tokens.extend(sample_tokens)
+                self._all_tokens.extend(sample_tokens)
+                self._sample_idx += 1
 
-                while len(all_tokens) >= max_buffer_token_len:
-                    x = torch.LongTensor(all_tokens[:max_buffer_token_len])
+                while len(self._all_tokens) >= max_buffer_token_len:
+                    x = torch.LongTensor(self._all_tokens[:max_buffer_token_len])
                     # update tokens to the remaining tokens
-                    all_tokens = all_tokens[max_buffer_token_len:]
+                    self._all_tokens = self._all_tokens[max_buffer_token_len:]
                     input = x[:-1]
                     label = x[1:]
                     yield input, label
+
             if not self.infinite:
                 logger.warning(f"Dataset {self.dataset_name} has run out of data.")
                 break
             else:
+                # Reset offset for the next iteration
+                self._sample_idx = 0
                 logger.warning(
                     f"Dataset {self.dataset_name} is being re-looped. "
                     "Loss related metrics might be misleading."
                 )
+
+    def _get_skipped_data_iter(self, skip_samples):
+        if isinstance(self._data, IterableDataset):
+            it = iter(self._data)
+            # Naively iterate through the samples as dataset length is unknown
+            for _ in range(skip_samples):
+                next(it)
+            return it
+
+        # Map-style dataset
+        # As skipping to the end throws an error, return an empty iterator
+        if skip_samples == len(self._data):
+            return iter([])
+        return iter(self._data.skip(skip_samples))
+
+
+    def load_state_dict(self, state_dict):
+        self._sample_idx = state_dict["sample_idx"]
+        self._all_tokens = state_dict["token_buffer"]
+        print("Loading checkpoint ", self._sample_idx, " tokens ", len(self._all_tokens))
+
+    def state_dict(self):
+        print("Saving checkpoint ", self._sample_idx, " tokens ", len(self._all_tokens))
+        return {"token_buffer": self._all_tokens, "sample_idx": self._sample_idx}
 
 
 def build_hf_data_loader(
@@ -152,4 +187,4 @@ def build_hf_data_loader(
         dataset_name, dataset_path, tokenizer, seq_len, world_size, rank, infinite
     )
 
-    return DataLoader(hf_ds, batch_size=batch_size)
+    return StatefulDataLoader(hf_ds, batch_size=batch_size)

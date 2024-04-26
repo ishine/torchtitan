@@ -20,6 +20,8 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
+from torch.utils.data import DataLoader
+from torchdata.stateful_dataloader import StatefulDataLoader
 from torchtitan.config_manager import JobConfig
 from torchtitan.logging_utils import logger
 
@@ -58,6 +60,20 @@ class OptimizerWrapper:
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         set_optimizer_state_dict(self.model, self.optim, optim_state_dict=state_dict)
 
+class DataLoaderWrapper:
+    def __init__(self, dataloader: DataLoader) -> None:
+        self.dataloader = dataloader
+        self.rank_id = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+
+    def state_dict(self) -> Dict[str, Any]:
+        if isinstance(self.dataloader, StatefulDataLoader):
+            return {self.rank_id: self.dataloader.state_dict()}
+        return {}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        if isinstance(self.dataloader, StatefulDataLoader):
+            self.dataloader.load_state_dict(state_dict[self.rank_id])
+
 
 class CheckpointManager:
     def __init__(
@@ -65,6 +81,7 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
+        dataloader: DataLoader,
         states: Dict[str, Any],
         job_config: JobConfig,
     ) -> None:
@@ -78,6 +95,7 @@ class CheckpointManager:
                     "model": ModelWrapper(model),
                     "optimizer": OptimizerWrapper(model, optimizer),
                     "lr_scheduler": lr_scheduler,
+                    "dataloader": DataLoaderWrapper(dataloader),
                 }
             )
 
